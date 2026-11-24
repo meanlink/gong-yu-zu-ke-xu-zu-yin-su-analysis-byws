@@ -8,6 +8,8 @@ from .auth import current_user, require_roles, issue_token, same_password
 from .schemas import LoginIn, ServiceEventIn, SurveyIn, ReviewIn
 from .resident_routes import router as resident_router
 from .services import audit, survey_rows, build_followups, get_analysis
+from . import survey_imports
+from .survey_import_schemas import ConflictResolveIn, ImportIn
 
 app = FastAPI(title="公寓租客续租因素分析")
 app.include_router(resident_router)
@@ -91,6 +93,22 @@ def add_service_event(payload: ServiceEventIn, user=Depends(require_roles("servi
 @app.get("/surveys")
 def surveys(user=Depends(current_user)):
     return survey_rows()
+
+@app.get("/survey-imports")
+def survey_import_batches(user=Depends(current_user)):
+    return {"batches": survey_imports.list_batches()}
+
+@app.post("/survey-imports")
+def import_paper_surveys(payload: ImportIn, user=Depends(require_roles("analyst", "customer_manager"))):
+    return survey_imports.import_sheets(payload, user)
+
+@app.get("/survey-conflicts")
+def survey_conflicts(user=Depends(current_user)):
+    return survey_imports.list_conflicts()
+
+@app.post("/survey-conflicts/{conflict_id}/resolve")
+def resolve_survey_conflict(conflict_id: int, payload: ConflictResolveIn, user=Depends(require_roles("analyst"))):
+    return survey_imports.resolve_conflict(conflict_id, payload, user)
 
 @app.post("/surveys")
 def add_survey(payload: SurveyIn, user=Depends(require_roles("analyst", "customer_manager"))):

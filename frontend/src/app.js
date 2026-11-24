@@ -106,8 +106,9 @@ function metric(title,value,kind){return el('div',{class:`metric ${kind}`},[el('
 async function properties(main){ const [ps,ts]=await Promise.all([api('/properties'),api('/tenants')]); main.append(pageTitle('房源档案','看清租金、房龄和在住关系，为续租解释保留上下文。')); main.append(el('section',{class:'panel'},[el('div',{class:'panel-title'},[el('h2',{text:'房源与租客关系'}),badge(`${ps.length} 套房源`,'blue')]),table(['房源','片区','租金','楼层','房龄','租客','状态'],ps.map(p=>{const t=ts.find(x=>x.property_id===p.id);return [p.code,p.neighborhood,`¥${p.monthly_rent}`,`${p.floor}F`,`${p.property_age_years}年`,t?.full_name||'—',badge(t?.status==='active'?'在住':'已退租',t?.status==='active'?'green':'neutral').textContent]}))])); }
 async function services(main){ const [events,ts]=await Promise.all([api('/service-events'),api('/tenants')]); main.append(pageTitle('报修服务','服务事件是续租解释的重要前因，先让处理过程可见。')); const form=el('form',{class:'inline-form',id:'service-form'},[select('tenant_id','租客',ts.filter(t=>t.status==='active').map(t=>[t.id,t.full_name])),select('category','问题类别',[['漏水','漏水'],['空调','空调'],['网络','网络'],['清洁','清洁'],['电梯','电梯']]),select('severity','紧急度',[['routine','常规'],['urgent','紧急'],['emergency','特急']]),el('input',{name:'summary',placeholder:'简述服务事件',required:true}),el('button',{class:'button primary',type:'submit',text:'登记事件'})]); main.append(el('section',{class:'panel'},[el('div',{class:'panel-title'},[el('h2',{text:'新增服务事件'}),badge('服务协调员 / 客户经理','green')]),form])); main.append(el('section',{class:'panel'},[el('div',{class:'panel-title'},[el('h2',{text:'近期服务记录'}),badge(`${events.length} 条`,'blue')]),table(['租客','房源','类别','紧急度','耗时','评分','状态'],events.map(e=>[e.tenant_name,e.property_code,e.category,e.severity,e.resolution_days?`${e.resolution_days} 天`:'处理中',e.satisfaction_score||'—',e.status==='resolved'?'已解决':'处理中']))])); document.querySelector('#service-form').addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(e.target);try{await api('/service-events',{method:'POST',body:JSON.stringify({tenant_id:Number(fd.get('tenant_id')),category:fd.get('category'),severity:fd.get('severity'),summary:fd.get('summary'),status:'resolved',satisfaction_score:4})});toast('服务事件已登记','success');render()}catch(err){toast(err.message,'error')}}); }
 async function renewals(main){
-  const [surveys,tasks] = await Promise.all([api('/surveys'),api('/followups')]);
-  main.append(pageTitle('问卷与跟进','把问卷采集、解释模型和客户经营复核放在同一条链上。'));
+  const [surveys,tasks,conflicts,batches,tenants] = await Promise.all([
+    api('/surveys'),api('/followups'),api('/survey-conflicts'),api('/survey-imports'),api('/tenants')]);
+  main.append(pageTitle('问卷与跟进','把问卷采集、纸质补录、解释模型和客户经营复核放在同一条链上。'));
   const tenantOptions = [...new Map(surveys.map(s=>[s.tenant_id,[s.tenant_id,s.tenant_name]])).values()];
   const form = el('form',{class:'survey-form',id:'survey-form'},[
     select('tenant_id','选择租客',tenantOptions),
@@ -124,8 +125,12 @@ async function renewals(main){
     el('div',{class:'panel-title'},[el('h2',{text:'问卷采集'}),badge('重复问卷将被阻断','orange')]),
     form
   ]));
+  main.append(paperImportPanel(conflicts.open.length,batches.batches,tenants,['analyst','customer_manager'].includes(state.user.role)));
+  if (conflicts.open.length) main.append(conflictPanel(conflicts.open));
+  if (conflicts.resolved.length) main.append(resolvedConflictPanel(conflicts.resolved));
   const surveyRows = surveys.map(s=>[
-    s.tenant_name,s.lease_period,s.service_score,`${s.renewal_intent}/10`,
+    s.tenant_name,s.lease_period,`${s.service_score}/${s.renewal_intent}`,
+    `${s.origin==='paper_import'?'纸质入样':'人工采集'}${s.sample_version>1?` · 换卷 v${s.sample_version}`:''}`,
     s.status==='reviewed'?'已复核':'待复核',s.comments
   ]);
   const taskCards = tasks.map(t=>{
@@ -142,7 +147,7 @@ async function renewals(main){
   main.append(el('section',{class:'split-grid'},[
     el('div',{class:'panel'},[
       el('div',{class:'panel-title'},[el('h2',{text:'问卷样本'}),badge(`${surveys.length} 份`,'blue')]),
-      table(['租客','租期','服务','意愿','状态','备注'],surveyRows)
+      table(['租客','租期','服务/意愿','来源','状态','备注'],surveyRows)
     ]),
     el('div',{class:'panel'},[
       el('div',{class:'panel-title'},[el('h2',{text:'跟进清单'}),badge(`${tasks.length} 项`,'red')]),
@@ -177,6 +182,137 @@ async function renewals(main){
       toast('问卷已采集','success'); render();
     }catch(err){toast(err.message,'error');}
   });
+}
+
+// 一次导入的表单只生成一个批次号，失败重试沿用同一号码，后端按幂等键去重。
+const importKeys = new WeakMap();
+function importKeyFor(form){
+  if(!importKeys.has(form)) importKeys.set(form, (globalThis.crypto?.randomUUID?.() ||
+    `paper-${Date.now()}-${Math.random().toString(16).slice(2)}`));
+  return importKeys.get(form);
+}
+function parseSheetLines(text){
+  return text.split(/\r?\n/).map(line=>line.trim()).filter(line=>line && !line.startsWith('#')).map((line,index)=>{
+    const parts = line.split(/[,，\t]/).map(part=>part.trim());
+    if(parts.length < 8) throw new Error(`第 ${index+1} 行需要 8 列：租客ID,租期,整洁,服务,性价比,社区,意愿,答卷编号[,原话]`);
+    const [tenant_id,lease_period,cleanliness_score,service_score,value_score,community_score,renewal_intent,sheet_ref,...rest]=parts;
+    return {tenant_id:Number(tenant_id),lease_period,cleanliness_score:Number(cleanliness_score),service_score:Number(service_score),
+      value_score:Number(value_score),community_score:Number(community_score),renewal_intent:Number(renewal_intent),
+      sheet_ref,comments:rest.join(',')};
+  });
+}
+function paperImportPanel(openCount,batches,tenants,canImport){
+  const form = el('form',{class:'resident-fields',id:'paper-import-form'},[
+    el('label',{},['纸质答卷（每行：租客ID,租期,整洁,服务,性价比,社区,意愿,答卷编号,原话）',
+      el('textarea',{name:'sheets',rows:5,placeholder:'例如：\n3,2026-2027,4.2,3.8,3.5,4.0,7,ZX-2026-001,愿意续租'})]),
+    el('label',{},['文件（CSV 或 JSON，可选）',el('input',{name:'file',type:'file',accept:'.csv,.json,text/csv,application/json'})]),
+    el('label',{},['导入备注',el('input',{name:'note',placeholder:'例如：10 月纸质问卷第一批'})]),
+    el('p',{class:'resident-feedback',role:'status'}),
+    el('button',{class:'button primary',type:'submit',text:'导入答卷'})
+  ]);
+  const tenantHints = tenants.filter(t=>t.status==='active').map(t=>`${t.id}=${t.full_name}`).join(' · ');
+  bindImport(form,tenants,tenantHints);
+  const batchRows = batches.map(b=>[`#${b.id}`,b.source,`${b.sheet_count} 份`,b.accepted_count,b.staged_count,b.duplicate_count,b.conflict_count]);
+  return el('section',{class:'panel'},[
+    el('div',{class:'panel-title'},[el('h2',{text:'纸质问卷补录'}),badge(openCount ? `${openCount} 组待裁定` : '无冲突待裁定',openCount?'orange':'green')]),
+    el('p',{class:'muted',text:'无冲突答卷直接入样；同一租客同一租期出现不同答案时整组暂存，原问卷继续用于分析。导入中断后用同一批次号重试不会重复入样。'}),
+    el('p',{class:'muted',text:`在住租客：${tenantHints}`}),
+    canImport ? form : el('p',{class:'muted',text:'仅分析师和客户经理可以导入纸质答卷。'}),
+    batchRows.length ? table(['批次','来源','答卷','入样','暂存','重复','冲突组'],batchRows) : el('p',{class:'muted',text:'尚无导入批次'})
+  ]);
+}
+function bindImport(form,tenants,tenantHints){
+  const feedback = form.querySelector('[role=status]');
+  form.addEventListener('submit',async e=>{
+    e.preventDefault();
+    const data = new FormData(form);
+    const button = form.querySelector('[type=submit]');
+    button.disabled = true; feedback.textContent = '';
+    try{
+      const file = data.get('file');
+      let sheets = [];
+      if(file && file.size){
+        const text = await file.text();
+        if(/\.json$/i.test(file.name)){
+          const parsed = JSON.parse(text);
+          sheets = Array.isArray(parsed) ? parsed : parsed.sheets;
+          if(!Array.isArray(sheets)) throw new Error('JSON 里没有 sheets 数组');
+        } else sheets = parseSheetLines(text);
+      }
+      const typed = String(data.get('sheets')||'').trim();
+      if(typed) sheets = sheets.concat(parseSheetLines(typed));
+      if(!sheets.length) throw new Error('请粘贴答卷或选择文件');
+      const unknown = sheets.find(s=>!tenants.some(t=>t.id===Number(s.tenant_id)));
+      if(unknown) throw new Error(`租客 ${unknown.tenant_id} 不存在，请核对编号（${tenantHints}）`);
+      const result = await api('/survey-imports',{method:'POST',body:JSON.stringify({
+        idempotency_key:importKeyFor(form),note:data.get('note')||null,sheets
+      })});
+      const b = result.batch;
+      toast(result.replayed ? `该批次已导入过：入样 ${b.accepted_count}，暂存 ${b.staged_count}` :
+        `入样 ${b.accepted_count} 份，暂存 ${b.staged_count} 份，重复 ${b.duplicate_count} 份`,'success');
+      render();
+    }catch(err){ feedback.textContent = err.message; }
+    finally{ button.disabled = false; }
+  });
+}
+function scoreLine(sheet){
+  return `整洁 ${sheet.cleanliness_score} · 服务 ${sheet.service_score} · 性价比 ${sheet.value_score} · 社区 ${sheet.community_score} · 意愿 ${sheet.renewal_intent}/10`;
+}
+function conflictPanel(rows){
+  const analyst = state.user.role==='analyst';
+  const cards = rows.map(row=>{
+    const dispatched = Boolean(row.followup);
+    const options = row.sheets.map(sheet=>el('option',{value:sheet.id,
+      text:`${sheet.sheet_ref} · ${scoreLine(sheet)}${sheet.comments?` · ${sheet.comments}`:''}`}));
+    const sheetSelect = el('select',{name:'sheet_id'},options);
+    const note = el('input',{name:'note',placeholder:'裁定原因（至少 4 个字）',minlength:4,maxlength:300,required:true});
+    const feedback = el('p',{class:'resident-feedback',role:'status'});
+    const adopt = el('button',{class:'button primary',type:'button',text:'采用所选答卷入样',
+      onClick:()=>resolveConflict(row.id,'adopted',sheetSelect.value,note,feedback,adopt,keep)});
+    const keep = el('button',{class:'button secondary',type:'button',text:'保留原答案',
+      onClick:()=>resolveConflict(row.id,'kept_original',null,note,feedback,adopt,keep)});
+    if(dispatched){adopt.disabled=true;adopt.title='原问卷已派出跟进，只能保留原答案并写明原因';}
+    return el('article',{class:'panel resident-record'},[
+      el('header',{},[el('h3',{text:`${row.tenant_name} · ${row.lease_period}`}),badge(dispatched?`已派单 #${row.followup.id}`:'待裁定',dispatched?'orange':'red')]),
+      el('p',{class:'muted resident-meta',text:`${row.property_code} · 原租期结束 ${row.lease_end_date} · ${row.reason_code==='answers_disagree'?'几份答卷彼此不一致':'导入答案与原问卷不一致'}`}),
+      el('dl',{},[
+        el('div',{},[el('dt',{text:'原问卷（分析样本）'}),el('dd',{text:row.original?`${scoreLine(row.original)} · ${row.original.comments||'无原话'}`:'尚无原问卷'})]),
+        ...row.sheets.map(sheet=>el('div',{},[el('dt',{text:`暂存答卷 ${sheet.sheet_ref}`}),el('dd',{text:`${scoreLine(sheet)} · ${sheet.comments||'无原话'}`})]))
+      ]),
+      dispatched?el('p',{class:'resident-note',text:'原问卷已经派出跟进，裁定只能保留原答案并写明原因，跟进依据保持不变。'}):null,
+      analyst?el('form',{class:'resident-fields resident-actions',onSubmit:e=>e.preventDefault()},[
+        el('label',{},['采用哪份答卷',sheetSelect]),
+        el('label',{},['裁定原因',note]),feedback,
+        el('div',{class:'action-row'},[adopt,keep])
+      ]):el('p',{class:'muted',text:'等待数据分析师裁定。'})
+    ]);
+  });
+  return el('section',{},[
+    el('div',{class:'page-head'},[el('div',{},[el('h2',{text:'问卷冲突待裁定'}),el('p',{class:'muted',text:'整组暂存不进入样本；裁定前原问卷照常用于分析和跟进。'})])]),
+    ...cards
+  ]);
+}
+async function resolveConflict(id,resolution,sheetId,note,feedback,adopt,keep){
+  if(!note.value.trim() || note.value.trim().length<4){ feedback.textContent='请填写至少 4 个字的裁定原因'; return; }
+  adopt.disabled = true; keep.disabled = true; feedback.textContent='';
+  try{
+    const body = {resolution,note:note.value.trim()};
+    if(resolution==='adopted') body.sheet_id=Number(sheetId);
+    await api(`/survey-conflicts/${id}/resolve`,{method:'POST',body:JSON.stringify(body)});
+    toast(resolution==='adopted'?'已采用所选答卷，样本已换卷':'已保留原答案，冲突关闭','success');
+    render();
+  }catch(err){ feedback.textContent = err.message; adopt.disabled = false; keep.disabled = false; }
+}
+function resolvedConflictPanel(rows){
+  return el('section',{class:'panel'},[
+    el('div',{class:'panel-title'},[el('h2',{text:'已裁定冲突'}),badge(`${rows.length} 组`,'green')]),
+    table(['租客','租期','裁定','选中答卷','原因','裁定时间'],rows.map(row=>{
+      const chosen = row.sheets.find(sheet=>sheet.id===row.resolved_sheet_id);
+      return [row.tenant_name,row.lease_period,row.resolution==='adopted'?'采用导入答卷':'保留原答案',
+        chosen ? chosen.sheet_ref : '—',row.note,
+        row.resolved_at ? new Date(row.resolved_at).toLocaleString('zh-CN',{hour12:false}) : '—'];
+    }))
+  ]);
 }
 function scoreInput(name,label){return el('label',{class:'compact'},[label,el('input',{name,type:'number',min:1,max:5,step:.1,value:'4'})]);}
 function select(name,label,options){return el('label',{class:'compact'},[label,el('select',{name},options.map(o=>el('option',{value:o[0],text:o[1]})))]);}
